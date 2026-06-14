@@ -1,0 +1,164 @@
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+#include <Servo.h>
+
+//핀번호 설정 마음대로 바꾸지 말것! time out? 이외의 핀번호 조합은 각 라이브러리간 간섭이 발생하여 통신이 불안정함.
+
+//nRF24핀 설
+#define CE_PIN 7
+#define CSN_PIN 8
+
+#define SERVO_PITCH_PIN 9
+#define SERVO_YAW_PIN 10
+
+// ===== PWM 채널 =====
+//(하드웨어 인터럽트 핀수는 보드 종류마다 정해져있다. 인러럽트 핀이 아닌곳에 연결하면 신호를 받지 못하므로 주의할것... 아두이노 우노의 경우 D2,D3이 인터럽트 핀이다.)
+
+// RC카 수신기로부터 펄스신호를 읽어들이는 디지털 핀 
+#define PWM_LED_PIN 2
+#define PWM_BUZZER_PIN 3
+
+//출력용 핀
+#define LED_PIN 5
+#define BUZZER_PIN 4
+
+RF24 radio(CE_PIN, CSN_PIN);
+const byte address[6] = "00001";// 수신측에서는 이 주소로부터 데이터를 읽어들인다.
+
+Servo servoPitch;
+Servo servoYaw;
+
+struct IMUData { // 롤,피치,요 값을 구조체 형식으로 저
+  float roll;
+  float pitch;
+  float yaw;
+};
+
+IMUData data;
+
+// ===== PWM 채널1 (LED) =====
+volatile unsigned long riseTime1 = 0; // pwm신호 상승(edge 감지시간) 초기화
+volatile int pwmLED = 1500; // PWM 펄스길이,초기값 1500(중립)상태로 초기화
+
+// ===== PWM 채널2 (BUZZER) =====
+volatile unsigned long riseTime2 = 0;
+volatile int pwmBuzzer = 1500; // volatile → 인터럽트 안에서 변경될 수 있는 변수임을 알려줌
+
+
+// ===== 인터럽트 함수(LED)=====
+void isrLED() {
+  if (digitalRead(PWM_LED_PIN) == HIGH) { // VCC를 기준으로 2/3정도면 HIGH로 인식한다.
+    riseTime1 = micros(); // 상승엣지 시간을 기록
+  } 
+  else {
+    pwmLED = micros() - riseTime1;// 하강 엣지 상승시간과 현재 시간 차이를 계산 -> 펄스폭
+  }
+}
+
+// ===== 인터럽트 함수(buzzer)=====
+void isrBuzzer() {
+  if (digitalRead(PWM_BUZZER_PIN) == HIGH) {
+    riseTime2 = micros();
+  } 
+  else {
+    pwmBuzzer = micros() - riseTime2;
+  }
+}
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(PWM_LED_PIN, INPUT);
+  pinMode(PWM_BUZZER_PIN, INPUT);  
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  servoPitch.attach(SERVO_PITCH_PIN);
+  servoYaw.attach(SERVO_YAW_PIN);
+
+
+  /*아두이노 우노의 경우 사용 가능한 인터럽트핀은 2개 뿐이다(D2,D3)*/
+  // 인터럽트 기능(어떤 이벤트가 발생했을때 지금 실행중인 코드를 잠깐 멈추고 지정한 함수를 즉시 실행시키는 기능)
+  // rc카 수신기에서 나오는 아날로그 pwm신호를 디지털 인터럽트로 읽어들임.
+  attachInterrupt(digitalPinToInterrupt(PWM_LED_PIN), isrLED, CHANGE); // attachInterrupt(인터럽트번호, 실행할함수, 감지조건); 
+  //여기서 변수가 핀번호가 아니라 인터럽트 번호임에 주의하라! 아두이노 우노 기준 인터럽트 번호 0 <-> D2, 인터럽트 번호 1 <->D3에 대응한다.
+  attachInterrupt(digitalPinToInterrupt(PWM_BUZZER_PIN), isrBuzzer, CHANGE);//digitalPinToInterrupt(PWM_LED_PIN); 핀번호를 인터럽트 번호로 변환함.(보드마다 인터럽트 가능한 핀이 다르기 때문에 이렇게 변환해서 사용한다.)
+  //또한 인터럽트 함수의 번호가 낮을 수록 우선순위가 높아진다.
+    
+    if (!radio.begin()) { // radio.begin()
+     Serial.println("nRF24 not detected"); // 만약 radio.begin()이 실행되지 않으면 실행될때까지 반복 
+     while (1);
+    }
+
+  radio.setRetries(5, 15); // 자동 재전송 설정(수신기가 응답 안 하면 재전송하는 기능)( setRetries(delay, count) (5<-재전송 전 대기시간)(15<- 최대 재전송 회수) ) , 수신측 필요는 없음.
+  radio.setChannel(108);// 라디오 체널을 반드시 송신측과 일치시킬것
+  radio.setPALevel(RF24_PA_MAX);// 출력 전력 최대(송신강도)
+  radio.setDataRate(RF24_250KBPS);// 송수신 속도를 낮추는 대신에 최대 거리 확보
+  radio.openReadingPipe(0, address);
+  radio.startListening();// 수신모드 활성화
+
+  Serial.println("Receiver Ready");
+}
+
+void loop() {
+
+  // ===== PWM 값 복사 =====
+  // 인터럽트와 loop()문에서 같은 변수가 사용되어져서 코드가 꼬이는 현상을 방지하기 위해서 변수값을 복사해서 사용한다.
+  int pwm1 = pwmLED;
+  int pwm2 = pwmBuzzer;
+
+  // ===== LED 제어 =====
+  if (pwm1 > 900 && pwm1 < 2100) { // 정상범위의 pwm신호만 읽어들임.
+
+    int brightness = map(pwm1, 1000, 2000, 0, 255); // pwm신호값을 디지털값으로 변환
+    brightness = constrain(brightness, 0, 255);
+
+    analogWrite(LED_PIN, brightness);
+  }
+
+  // ===== BUZZER 제어 =====
+  // tone(pin, frequency, duration)->(출력핀, 소리의 주파수(Hz), 소리를 내는 시간(ms))
+  // 해당 핀에서 지정한 주파수의 pwm신호(사각형신호)를 만들어 스피커/버저를 울린다. 
+  // tone()함수의 듀티비는 50%고정이다.
+  
+  
+  if (pwm2 > 1700) {
+    digitalWrite(BUZZER_PIN,HIGH); // duration 생략시 계속 울림.
+  } 
+  else {
+    digitalWrite(BUZZER_PIN,LOW); // tone()으로 울린 소리를 즉시 끄는 함수, 지정 핀의 pwm 출력 신호를 제거
+  }
+
+
+  // ===== RF24 데이터 수신 =====
+  if (radio.available()) {
+
+    radio.read(&data, sizeof(data));
+
+    Serial.print("Roll: ");
+    Serial.print(data.roll, 2);
+    Serial.print(" | Pitch: ");
+    Serial.print(data.pitch, 2);
+    Serial.print(" | Yaw: ");
+    Serial.println(data.yaw, 2);
+
+
+  // =====브러시리스 모터는 일반적인 각도 제어가 아니라 pwm신호로 제어해야한다. =====
+  // 따라서 pitch/yaw의 각도 값을 회전속도 PWM으로 변환
+  // 일반적으로 1500 = 정지,  1000~1500 = 반시계방향,  1500~2000 = 시계방향  이다.
+
+int pitchPWM = map(data.pitch, -45, 45, 1700, 1300);
+int yawPWM   = map(data.yaw,   -90, 90, 1700, 1300);
+
+pitchPWM = constrain(pitchPWM, 1300, 1700);
+yawPWM   = constrain(yawPWM,   1300, 1700);
+
+// ===== 짐벌 출력 ===== 서보 라이브러리에서 서보모터에 pwm제어 신호를 보내는 코드.
+servoPitch.writeMicroseconds(pitchPWM);
+servoYaw.writeMicroseconds(yawPWM);
+
+  }
+}
