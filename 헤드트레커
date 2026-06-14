@@ -1,0 +1,133 @@
+// 아두이노 나노 33 iot i2c핀은 SDA A4, SCL A5이다.
+
+#include <Wire.h>  // I2C통신에 사용(여기서는 BNO08x와 통신하기 위해사용)
+#include <Adafruit_BNO08x.h>
+#include <SPI.h> //SPI통신에 사용(여기서는 nrf24L01과 통신하기 위해사용)
+#include <RF24.h> //nRF24L01모듈 제어용 라이브러리
+
+#define RAD_TO_DEG 57.2957795131 // 라디안을 도로 변환하는 상수(180/pi)
+#define BUTTON_PIN 2 // IMU yaw초기화용 버튼 핀 할당 D2 
+
+// nRF24 설정
+#define CE_PIN 7 // (임의의 디지털 핀으로 변경가능)
+#define CSN_PIN 8 // (임의의 디지털 핀으로 변경가능)
+
+RF24 radio(CE_PIN, CSN_PIN);
+const byte address[6] = "00001"; // nRF24통신 주소, 6바이트 문자열로 송수신 구분. 송신측에서는 이 주소를 열어 데이터를 전송한다.
+
+Adafruit_BNO08x bno08x; // BNO08x센서 객체생성
+sh2_SensorValue_t sensorValue; // 센서 데이터를 임시 저장할 구조체
+//  sh2_SensorValue_t는 BNO08x IMU센서에서 사용하는 구조체(struct)로 센서에서 읽어온 데이터 값 (롤,피치,요,가속도,각속도 등의 데이터)를 하나로 묶어 관리 할때 쓰는 데이터 타입이다.
+
+float yaw_offset = 0.0f; // yaw 0점 초기화용 오프셋
+bool resetYaw = false;
+
+// 송신 데이터 구조체(송신할 IMU데이터를 하나의 구조체로 담음)
+// 구조체를 선언함으로서 여러 데이터(여기서는 롤,피치,요)를 한 변수안에서 깔끔하게 묶어서 관리하는게 가능해진다. 구조체를 사용하지 않으면 롤,피치,요 값을 매번 따로 처리해서 송신해야함... <- 구조체를 사용하는 이유.
+struct IMUData { // 롤,피치,요 값을 float형식으로 저장 
+  float roll;
+  float pitch;
+  float yaw;
+};
+
+IMUData data; // 송신용 구조체 변수 선언 
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);// 시리얼 출력이 정상적으로 실행되도록 딜레이 부여
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP); // 풀업저항을 사용해서 플로팅 발생을 차단
+
+  Wire.begin();
+  Wire.setClock(400000); // I2C클럭속도 400kHz로 설정(Fast-mode)
+
+ // bno08x샌서 시작
+  if (!bno08x.begin_I2C()) {
+    Serial.println("BNO08x not detected");
+    while (1);
+  }
+
+  bno08x.enableReport(SH2_ROTATION_VECTOR, 2000); // 회전 벡터 보고서 활성화
+  // 2000ms간격으로 센서 데이터를 업데이트(IMU에서 쿼터니언 값을 획득)
+
+  // RF 시작
+  if (!radio.begin()) {
+    Serial.println("nRF24 not detected");
+    while (1);
+  }
+  // radio설정은 수신측과 일치시켜야지만 데이터 송수신이 가능하다.
+
+  radio.setRetries(5, 15); // radio.setRetries(delay, count); 패킷 몇 개 날아가도 복구됨, 해당 설정이 없으면 신호가 조금만 나빠져도 연결이 바로 끊켜버린다.
+  radio.setPALevel(RF24_PA_MAX);// 출력 전력 최대(송신강도)
+  radio.setDataRate(RF24_250KBPS);// 송수신 속도를 낮추는 대신에 최대 거리 확보
+  radio.setChannel(108); // 2.4GHz 채널 지정(간섭회피) 간섭 없는 채널(108번 채널)선택, 108번 채널 대역대가 보통 2.4GHz범위 송수신중에 가장 사용 빈도가 적기때문에... 끊킴이 발생하면 다른 채널설정하것!
+  radio.openWritingPipe(address);// 송신주소 열기
+  radio.stopListening();//송신모드 활성화 
+  
+  Serial.println("System Ready");
+}
+
+void loop() {
+  // 버튼 입력감지
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    resetYaw = true;
+    delay(200);
+  }
+
+  if (bno08x.getSensorEvent(&sensorValue)) { //센서 데이터 수신 후, 성공 시 sensorValue 구조체에 그 값을 저장
+
+    if (sensorValue.sensorId == SH2_ROTATION_VECTOR) { // 회전 벡터 이벤트인지 확인(쿼터니언)
+
+     // 쿼터니언 -> 오일러각으로 변환
+      float qw = sensorValue.un.rotationVector.real; // 쿼터니언의 실수부
+      float qx = sensorValue.un.rotationVector.i; // 쿼터니언 허수부
+      float qy = sensorValue.un.rotationVector.j; // 쿼터니언 허수부
+      float qz = sensorValue.un.rotationVector.k; // 쿼터니언 허수부
+
+      float roll = atan2(2.0f*(qw*qx + qy*qz),
+                         1.0f - 2.0f*(qx*qx + qy*qy));
+
+      float pitch = asin(2.0f*(qw*qy - qz*qx));
+
+      float yaw = atan2(2.0f*(qw*qz + qx*qy),
+                        1.0f - 2.0f*(qy*qy + qz*qz));
+
+      roll  *= RAD_TO_DEG;
+      pitch *= RAD_TO_DEG;
+      yaw   *= RAD_TO_DEG;
+      
+      // 버튼 입력감지에 따른 동작
+      if (resetYaw) {
+        yaw_offset = yaw;
+        resetYaw = false;
+      }
+
+      yaw -= yaw_offset;
+
+      //yaw값을 -180 ~ +180사이의 값으로 설정하기 위해서
+      if (yaw > 180.0f) yaw -= 360.0f;
+      if (yaw < -180.0f) yaw += 360.0f;
+
+      // 구조체에 롤, 피치, 요 값을 저장(float형식으로)
+      data.roll = roll;
+      data.pitch = pitch;
+      data.yaw = yaw;
+      
+      Serial.print("roll: ");
+      Serial.print(roll,2); // 소숫점 2째자리까지 표기
+      Serial.print(", pitch: ");
+      Serial.print(pitch,2);
+      Serial.print(", yaw: ");
+      Serial.println(yaw);
+      
+      // nrF24L01을 통해 송신(바이너리 구조체에 그대로 전송)
+      radio.write(&data, sizeof(data)); 
+      
+      /*첫번째 인자 &data -> 전송할 데이터의 시작 주소(포인터)
+        두번째 인자 sizeof(data) -> 전송할 데이터 크기(바이트 수)
+        즉, 메모리 상에 있는 data구조체 전체를 그 크기만큼 그대로 바이트 단위로 전송하겠다.
+    
+      */
+    }
+  }
+}
